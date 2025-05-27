@@ -1,0 +1,34 @@
+
+datasource db {
+  provider     = "mysql"
+  url          = env("DATABASE_URL")
+  relationMode = "prisma"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Student {
+  id             String    @id @default(cuid())
+  name           String    // Kullanıcının girdiği görünen ad
+  clerkId        String?   @unique // Clerk kullanıcısının ID'si. Misafirler için null.
+  guestSessionId String?   @unique // Misafir kullanıcılar için benzersiz oturum ID'si.
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  submissions    Submission[]
+}
+
+model Submission {
+  id              String   @id @default(cuid())
+  topic           String
+  ageGroup        String
+  learningOutcome String
+  messages        Json
+  evaluation      Json?
+  submittedAt     DateTime @default(now())
+
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId String
+}

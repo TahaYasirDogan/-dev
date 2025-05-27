@@ -5,12 +5,17 @@ import { FiArrowUp } from "react-icons/fi";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import toast from "react-hot-toast";
+import FinishModal from "./FinishModal"; // Tailwind versiyonu
+import { useSidebar } from "../chat/SidebarContext";
 
 interface ChatPageProps {
   ageGroup: string;
   topic: string;
   learningOutcome: string;
 }
+
+const CHAT_APP_SESSION_KEY = "chatAppSession";
+const STUDENT_NAME_KEY = "chatAppStudentName";
 
 export default function ChatPage({
   ageGroup,
@@ -20,26 +25,98 @@ export default function ChatPage({
   const [messages, setMessages] = useState<{ role: string; content: string }[]>(
     []
   );
+  const [showFinishModal, setShowFinishModal] = useState(false);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const hasFetchedRef = useRef(false);
+  const hasFetchedInitialQuestionRef = useRef(false);
+  const { isOpen } = useSidebar();
+
   const [evaluation, setEvaluation] = useState<null | {
     puan: number;
     artilar: string;
     eksiler: string;
   }>(null);
 
-  // İlk mesaj: sistem talimatı
-  useEffect(() => {
-    console.log("ChatPage props:", { ageGroup, topic, learningOutcome });
-    if (hasFetchedRef.current) return;
-    hasFetchedRef.current = true;
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const [puanArtisi, setPuanArtisi] = useState<number | null>(null);
+  const previousPuanRef = useRef<number>(0);
 
-    const initialMessages = [
-      {
-        role: "system",
-        content: `Sen bir öğretmensin. Yaş grubu: ${ageGroup}. Konu: ${topic}.
+  // --- ÖĞRENCİ ADI STATE'LERİ ---
+  const [studentName, setStudentName] = useState<string | null>(null);
+  const [isNameModalOpen, setIsNameModalOpen] = useState(false);
+  const [tempStudentName, setTempStudentName] = useState("");
+
+  // --- API'DEN İLK SORUYU ALMA ---
+  const fetchInitialQuestion = async (
+    systemMessages: { role: string; content: string }[]
+  ) => {
+    if (hasFetchedInitialQuestionRef.current) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    hasFetchedInitialQuestionRef.current = true;
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: systemMessages }),
+      });
+
+      if (!res.ok)
+        throw new Error(
+          `API isteği başarısız: ${res.status} ${res.statusText}`
+        );
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) throw new Error("İlk soru alınamadı: Boş yanıt");
+
+      const parsed = JSON.parse(content);
+      const { puan, artilar, eksiler, sonrakiMesaj } = parsed;
+      if (puan < 0 || puan > 100) throw new Error(`Geçersiz puan: ${puan}`);
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: sonrakiMesaj },
+      ]);
+      setEvaluation({ puan, artilar, eksiler });
+      previousPuanRef.current = puan;
+      toast.success("Etkinlik başladı! 🚀");
+    } catch (err: any) {
+      setError(`Başlangıç sorusu yüklenemedi: ${err.message}`);
+      toast.error("Bir hata oluştu, lütfen tekrar deneyin.");
+      hasFetchedInitialQuestionRef.current = false;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- YENİ SOHBET OTURUMU BAŞLATMA ---
+  const startNewChatSession = (isRestart: boolean = false) => {
+    if (!studentName && !isRestart) {
+      // Eğer isim yoksa ve bu bir restart değilse, isim beklenmeli
+      console.log(
+        "Student name not set, waiting for name input to start session."
+      );
+      setIsNameModalOpen(true);
+      setLoading(false);
+      return;
+    }
+    console.log(
+      "Starting new chat session. Student:",
+      studentName,
+      "Is restart:",
+      isRestart
+    );
+    setLoading(true);
+    setError(null);
+    setEvaluation(null);
+    previousPuanRef.current = 0;
+    hasFetchedInitialQuestionRef.current = false;
+
+    const systemMessageContent = `Sen bir öğretmensin. Yaş grubu: ${ageGroup}. Konu: ${topic}.
 Öğrencinin öğrenme çıktısı: ${learningOutcome}.
 
 Öğrenciyle etkileşime başlarken (ilk mesajın) VE her öğrenci cevabından sonra *her zaman ve yalnızca* aşağıdaki JSON formatında yanıt ver:
@@ -108,68 +185,151 @@ Kurallar:
 - **Fayda 1**: Açıklama.
 - **Fayda 2**: Açıklama.
 ❓ Şimdi düşün: [yeni soru]
-- JSON dışında hiçbir şey üretme.`,
-      },
+- JSON dışında hiçbir şey üretme.`;
+
+    const initialSystemMessage = [
+      { role: "system", content: systemMessageContent },
     ];
+    setMessages(initialSystemMessage);
+    fetchInitialQuestion(initialSystemMessage);
+  };
 
-    setMessages(initialMessages);
+  // --- LOCALSTORAGE'A KAYDETME ---
+  useEffect(() => {
+    if (
+      studentName &&
+      (messages.length > 1 ||
+        (messages.length === 1 && messages[0].role !== "system") ||
+        evaluation)
+    ) {
+      const sessionData = {
+        studentName, // Öğrenci adını da kaydet
+        props: { ageGroup, topic, learningOutcome },
+        messages,
+        evaluation,
+      };
+      localStorage.setItem(CHAT_APP_SESSION_KEY, JSON.stringify(sessionData));
+    }
+  }, [messages, evaluation, ageGroup, topic, learningOutcome, studentName]);
 
-    const getInitialQuestion = async () => {
-      setLoading(true);
-      try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: initialMessages }),
-        });
-
-        if (!res.ok) {
-          throw new Error(
-            `API isteği başarısız: ${res.status} ${res.statusText}`
-          );
-        }
-
-        const data = await res.json();
-        console.log("API Yanıtı:", data); // Hata ayıklama
-
-        const content = data.choices?.[0]?.message?.content;
-        if (!content) {
-          throw new Error("İlk soru alınamadı: Boş yanıt");
-        }
-
-        let parsed;
+  // --- SAYFA YÜKLENDİĞİNDE OTURUM VE İSİM KONTROLÜ ---
+  useEffect(() => {
+    const storedName = localStorage.getItem(STUDENT_NAME_KEY);
+    if (storedName) {
+      setStudentName(storedName);
+      // İsim varsa, oturumu yüklemeye çalış
+      const storedSessionString = localStorage.getItem(CHAT_APP_SESSION_KEY);
+      let loadedFromValidSession = false;
+      if (storedSessionString) {
         try {
-          parsed = JSON.parse(content);
-        } catch (parseError) {
-          throw new Error(`JSON parse hatası: ${parseError.message}`);
+          const sessionData = JSON.parse(storedSessionString);
+          if (
+            sessionData.studentName === storedName && // Kayıtlı isimle eşleşmeli
+            sessionData.props &&
+            sessionData.props.ageGroup === ageGroup &&
+            sessionData.props.topic === topic &&
+            sessionData.props.learningOutcome === learningOutcome
+          ) {
+            if (sessionData.messages && sessionData.messages.length > 0) {
+              setMessages(sessionData.messages);
+              if (sessionData.evaluation) {
+                setEvaluation(sessionData.evaluation);
+                previousPuanRef.current = sessionData.evaluation.puan;
+              } else {
+                setEvaluation(null);
+                previousPuanRef.current = 0;
+              }
+              loadedFromValidSession = true;
+              hasFetchedInitialQuestionRef.current = true;
+              toast.success(
+                "Sohbete kaldığınız yerden devam ediyorsunuz!  retomar"
+              );
+            }
+          } else {
+            localStorage.removeItem(CHAT_APP_SESSION_KEY); // Uyumsuz oturumu temizle
+          }
+        } catch (e) {
+          localStorage.removeItem(CHAT_APP_SESSION_KEY);
         }
-
-        const { puan, artilar, eksiler, sonrakiMesaj } = parsed;
-        if (puan < 0 || puan > 100) {
-          throw new Error(`Geçersiz puan: ${puan}`);
-        }
-
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: sonrakiMesaj },
-        ]);
-        setEvaluation({ puan, artilar, eksiler });
-        toast.success("Etkinlik başladı! 🚀");
-      } catch (err) {
-        console.error("API Hatası:", err);
-        setError(`Başlangıç sorusu yüklenemedi: ${err.message}`);
-        toast.error("Bir hata oluştu, lütfen tekrar deneyin.");
-      } finally {
-        setLoading(false);
       }
-    };
+      if (!loadedFromValidSession) {
+        startNewChatSession(); // İsim var ama geçerli oturum yok, yeni başlat
+      }
+      setLoading(false);
+    } else {
+      setIsNameModalOpen(true); // İsim yok, modalı aç
+      setLoading(false); // Ana yüklemeyi durdur
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ageGroup, topic, learningOutcome]); // studentName'i buraya eklemeyin, sonsuz döngüye girebilir.
+  // studentName değişimi ayrı bir useEffect ile yönetilebilir veya
+  // handleNameSubmit içinde startNewChatSession çağrılabilir.
 
-    getInitialQuestion();
-  }, [ageGroup, topic, learningOutcome]);
+  // --- İSİM GİRİŞİ YAPILDIĞINDA ---
+  const handleNameSubmit = () => {
+    if (tempStudentName.trim()) {
+      const finalName = tempStudentName.trim();
+      setStudentName(finalName);
+      localStorage.setItem(STUDENT_NAME_KEY, finalName);
+      setIsNameModalOpen(false);
+      setLoading(true); // Şimdi sohbet yüklemesi/başlatması için loading'i true yap
+      // İsim set edildikten sonra, eğer localStorage'da bu isme ait geçerli bir oturum yoksa
+      // veya props değişmişse yeni oturum başlatılmalı.
+      // Bu, bir sonraki render'da ana useEffect'in tekrar çalışmasıyla (studentName artık null olmadığı için)
+      // veya doğrudan startNewChatSession çağrısıyla yapılabilir.
+      // Güvenli olması için, ana useEffect'in bu durumu ele almasını bekleyelim veya
+      // burada explicit olarak startNewChatSession'ı çağıralım.
+      // Mevcut ana useEffect, studentName null değilse ve geçerli oturum yoksa startNewChatSession'ı çağıracak.
+      // Ancak, ana useEffect'in bağımlılıklarında studentName olmadığı için,
+      // studentName değiştiğinde otomatik tetiklenmez. Bu yüzden burada explicit çağrı daha iyi olabilir.
 
+      // Oturum verisini kontrol et ve gerekirse yeni oturum başlat
+      const storedSessionString = localStorage.getItem(CHAT_APP_SESSION_KEY);
+      let sessionIsValidForNewName = false;
+      if (storedSessionString) {
+        try {
+          const sessionData = JSON.parse(storedSessionString);
+          if (
+            sessionData.studentName === finalName &&
+            sessionData.props &&
+            sessionData.props.ageGroup === ageGroup &&
+            sessionData.props.topic === topic &&
+            sessionData.props.learningOutcome === learningOutcome &&
+            sessionData.messages &&
+            sessionData.messages.length > 0
+          ) {
+            setMessages(sessionData.messages);
+            if (sessionData.evaluation) {
+              setEvaluation(sessionData.evaluation);
+              previousPuanRef.current = sessionData.evaluation.puan;
+            }
+            hasFetchedInitialQuestionRef.current = true;
+            toast.success(
+              "Sohbete kaldığınız yerden devam ediyorsunuz!  retomar"
+            );
+            sessionIsValidForNewName = true;
+          } else {
+            localStorage.removeItem(CHAT_APP_SESSION_KEY); // Uyumsuz oturumu temizle
+          }
+        } catch (e) {
+          localStorage.removeItem(CHAT_APP_SESSION_KEY);
+        }
+      }
+
+      if (!sessionIsValidForNewName) {
+        startNewChatSession();
+      } else {
+        setLoading(false); // Oturum yüklendi, loading'i kapat
+      }
+    } else {
+      toast.error("Lütfen geçerli bir isim girin.");
+    }
+  };
+
+  // --- KULLANICI CEVABINI GÖNDERME ---
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim()) return;
+    if (!input.trim() || loading || !studentName) return; // İsim yoksa gönderme
 
     const userMessage = { role: "user", content: input };
     const updatedMessages = [...messages, userMessage];
@@ -185,31 +345,17 @@ Kurallar:
         body: JSON.stringify({ messages: updatedMessages }),
       });
 
-      if (!res.ok) {
+      if (!res.ok)
         throw new Error(
           `API isteği başarısız: ${res.status} ${res.statusText}`
         );
-      }
-
       const data = await res.json();
-      console.log("API Yanıtı (kullanıcı cevabı):", data);
-
       const content = data.choices?.[0]?.message?.content;
-      if (!content) {
-        throw new Error("Yanıt alınamadı: Boş yanıt");
-      }
+      if (!content) throw new Error("Yanıt alınamadı: Boş yanıt");
 
-      let parsed;
-      try {
-        parsed = JSON.parse(content);
-      } catch (parseError) {
-        throw new Error(`JSON parse hatası: ${parseError.message}`);
-      }
-
+      const parsed = JSON.parse(content);
       const { puan, artilar, eksiler, sonrakiMesaj } = parsed;
-      if (puan < 0 || puan > 100) {
-        throw new Error(`Geçersiz puan: ${puan}`);
-      }
+      if (puan < 0 || puan > 100) throw new Error(`Geçersiz puan: ${puan}`);
 
       setMessages((prev) => [
         ...prev,
@@ -217,8 +363,7 @@ Kurallar:
       ]);
       setEvaluation({ puan, artilar, eksiler });
       toast.success("Cevabınız gönderildi! 🎉");
-    } catch (err) {
-      console.error("API Hatası:", err);
+    } catch (err: any) {
       setError(`Yanıt alınamadı: ${err.message}`);
       toast.error("Bir hata oluştu, lütfen tekrar deneyin.");
     } finally {
@@ -226,16 +371,72 @@ Kurallar:
     }
   };
 
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  // --- ÖDEVİ GÖNDERME (BACKEND'E) ---
+  const handleSendAssignment = async () => {
+    if (!studentName) {
+      toast.error("Öğrenci adı bulunamadı. Lütfen adınızı girin.");
+      setIsNameModalOpen(true);
+      return;
+    }
+    if (
+      !messages ||
+      messages.filter((msg) => msg.role !== "system").length === 0
+    ) {
+      toast.error("Gönderilecek bir sohbet bulunamadı.");
+      return;
+    }
 
+    const submissionData = {
+      studentName: studentName,
+      topic: topic,
+      ageGroup: ageGroup,
+      learningOutcome: learningOutcome,
+      messages: messages.filter((msg) => msg.role !== "system"),
+      evaluation: evaluation,
+    };
+
+    setLoading(true);
+    try {
+      const response = await fetch("/api/submissions", {
+        // API endpoint'iniz
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(submissionData),
+      });
+
+      if (!response.ok) {
+        const errorData = await response
+          .json()
+          .catch(() => ({ error: "Bilinmeyen sunucu hatası" }));
+        throw new Error(errorData.error || `Sunucu hatası: ${response.status}`);
+      }
+      toast.success("Ödev başarıyla gönderildi!");
+      setShowFinishModal(false);
+      // İsteğe bağlı: handleRestart();
+    } catch (error: any) {
+      toast.error(`Ödev gönderilemedi: ${error.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- SOHBETİ YENİDEN BAŞLATMA ---
+  const handleRestart = () => {
+    setShowFinishModal(false);
+    setInput("");
+    setError(null);
+    // studentName'i localStorage'dan silmeyin, sadece oturumu silin
+    localStorage.removeItem(CHAT_APP_SESSION_KEY);
+    startNewChatSession(true);
+    toast("Sohbet yeniden başlatıldı!");
+  };
+
+  // --- DİĞER useEffect'ler (scroll, puan artışı, modal gösterme) ---
   useEffect(() => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages]);
-
-  const [puanArtisi, setPuanArtisi] = useState<number | null>(null);
-  const previousPuanRef = useRef<number>(0);
 
   useEffect(() => {
     if (evaluation && evaluation.puan !== previousPuanRef.current) {
@@ -250,25 +451,55 @@ Kurallar:
     }
   }, [evaluation]);
 
+  useEffect(() => {
+    if (evaluation && evaluation.puan === 100) {
+      setShowFinishModal(true);
+    }
+  }, [evaluation]);
+
+  if (isNameModalOpen) {
+    return (
+      <div className="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full flex items-center justify-center z-50">
+        <div className="p-8 bg-white rounded-lg shadow-xl w-full max-w-md">
+          <h2 className="text-2xl font-semibold mb-4">Hoş Geldin!</h2>
+          <p className="mb-4 text-gray-700">
+            Lütfen başlamadan önce adını veya bir rumuz gir.
+          </p>
+          <input
+            type="text"
+            value={tempStudentName}
+            onChange={(e) => setTempStudentName(e.target.value)}
+            className="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:ring-orange-500 focus:border-orange-500"
+            placeholder="Adın / Rumuzun"
+          />
+          <button
+            onClick={handleNameSubmit}
+            className="w-full bg-orange-500 text-white py-3 rounded-lg hover:bg-orange-600 transition"
+          >
+            Başla
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex justify-center bg-[#FFFCF5]">
       <div className="w-full h-full max-w-4xl rounded-lg">
         {evaluation && (
-          <div className="mb-4 flex bg-white items-center fixed top-0 left-0 right-0 max-w-4xl mx-auto rounded-2xl p-4 mt-2 shadow-md">
-            <div className="w-full bg-green-200 rounded-full h-4 mx-6 overflow-hidden">
+          <div
+            className={`
+            mb-4 flex items-center bg-white rounded-2xl p-4 shadow-md z-20
+            fixed top-0 right-0
+            
+            left-0
+            ${isOpen ? "lg:left-72" : "lg:left-0"}
+            max-w-xs md:max-w-4xl mx-auto
+          `}
+          >
+            <div className="w-full bg-green-200 rounded-full h-4 mx-2 md:mx-4 overflow-hidden">
               <div
-                className="
-                  h-full bg-green-500 rounded-full relative
-                  transition-all duration-500
-                  before:content-['']
-                  before:absolute
-                  before:top-[3.5px]
-                  before:left-[4px]
-                  before:right-[4px]
-                  before:h-[3px]
-                  before:bg-lime-400
-                  before:rounded-full
-                "
+                className="h-full bg-green-500 rounded-full relative transition-all duration-500 before:content-[''] before:absolute before:top-[3.5px] before:left-[4px] before:right-[4px] before:h-[3px] before:bg-lime-400 before:rounded-full"
                 style={{ width: `${Math.min(evaluation.puan, 100)}%` }}
               ></div>
             </div>
@@ -288,14 +519,12 @@ Kurallar:
             +{puanArtisi}
           </motion.div>
         )}
-
         {error && (
-          <div className="text-red-500 mb-4 text-center bg-red-100 p-4 rounded-lg">
+          <div className="text-red-500 mb-4 text-center bg-red-100 p-4 rounded-lg mt-20">
             {error}
           </div>
         )}
-
-        <div className="h-full overflow-y-auto mt-14 mb-20 p-4 rounded-lg">
+        <div className="h-full overflow-y-auto mt-14 mb-28 p-4 rounded-lg">
           {messages
             .filter((msg) => msg.role !== "system")
             .map((msg, idx) => (
@@ -337,29 +566,53 @@ Kurallar:
                 </div>
               </div>
             ))}
-          {loading && <div className="text-gray-400 italic">Yükleniyor...</div>}
+          {loading &&
+            messages.filter((m) => m.role !== "system").length === 0 && (
+              <div className="text-center text-gray-500 italic mt-10">
+                Etkinlik yükleniyor, lütfen bekleyin...
+              </div>
+            )}
+          {loading &&
+            messages.filter((m) => m.role !== "system").length > 0 && (
+              <div className="flex justify-start mb-2">
+                <div className="p-3 rounded-2xl text-black italic">
+                  Yükleniyor...
+                </div>
+              </div>
+            )}
           <div ref={messagesEndRef} />
         </div>
-
         <form
           onSubmit={handleSubmit}
-          className="flex items-center fixed bottom-5 left-0 right-0 max-w-4xl mx-auto"
+          className={`flex items-center fixed bottom-0 left-0 right-0 max-w-4xl mx-auto bg-[#FFFCF5] p-4 border-t border-gray-200
+            ${isOpen ? "lg:left-72" : "lg:left-0"}
+            max-w-xs md:max-w-4xl mx-auto
+            `}
         >
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
             className="flex-1 p-4 pr-14 rounded-3xl focus:outline-none bg-white focus:ring focus:ring-orange-500 shadow-2xl"
             placeholder="Cevabınızı yazın..."
-            disabled={loading}
+            disabled={loading || !studentName} // İsim yoksa veya yükleniyorsa disable
           />
           <button
             type="submit"
-            className="absolute right-2 bg-orange-500 rounded-full text-white p-2 hover:bg-orange-600 transition cursor-pointer"
-            disabled={loading}
+            className="absolute right-6 bg-orange-500 rounded-full text-white p-2 hover:bg-orange-600 transition cursor-pointer"
+            disabled={loading || !input.trim() || !studentName} // İsim yoksa disable
           >
             <FiArrowUp size={25} />
           </button>
         </form>
+        {showFinishModal && (
+          <FinishModal
+            isOpen={showFinishModal}
+            onClose={() => setShowFinishModal(false)}
+            onSend={handleSendAssignment} // Backend'e gönderme fonksiyonu
+            onRestart={handleRestart}
+            onContinue={() => setShowFinishModal(false)}
+          />
+        )}
       </div>
     </div>
   );
